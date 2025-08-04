@@ -24,7 +24,6 @@ def get_encryption_key():
         local_state = json.load(f)
     encrypted_key_b64 = local_state['os_crypt']['encrypted_key']
     encrypted_key = base64.b64decode(encrypted_key_b64)[5:]  # Remove 'DPAPI' prefix
-    # Decrypt key with Windows DPAPI
     decrypted_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
     return decrypted_key
 
@@ -38,8 +37,9 @@ def decrypt_password(ciphertext, key):
     - remaining bytes in the middle = encrypted password
     """
     try:
-        print(f"[DEBUG] Encrypted password prefix (hex): {ciphertext[:10].hex()}")  # Debug print
-        
+        # Debug: print first 10 bytes of ciphertext in hex
+        print(f"[DEBUG] Ciphertext prefix (hex): {ciphertext[:10].hex()}")
+
         if ciphertext[:3] == b'v10':
             iv = ciphertext[3:15]  # 12 bytes nonce
             payload = ciphertext[15:-16]  # encrypted data
@@ -73,6 +73,7 @@ def main():
     for origin_url, username, encrypted_password in cursor.fetchall():
         if not username and not encrypted_password:
             continue
+        encrypted_password = bytes(encrypted_password)  # <-- Crucial cast to bytes here
         decrypted_password = decrypt_password(encrypted_password, key)
         print(f"URL: {origin_url}")
         print(f"Username: {username}")
